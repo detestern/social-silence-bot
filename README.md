@@ -2,7 +2,7 @@
   <img src="logo.JPG" alt="logo" width="400">
 </p>
 
-<h1 align="center">Triage Bot</h1>
+<h1 align="center">Social silence bot</h1>
 
 <p align="center">
   A Gemini-powered filter for work chats: reads hundreds of messages a day and surfaces only what actually matters.
