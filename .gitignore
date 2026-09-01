@@ -1,0 +1,29 @@
+# Секреты и переменные окружения
+.env
+.env.*
+!.env.example
+
+# Telethon-сессия — это буквально доступ к аккаунту в Telegram
+*.session
+*.session-journal
+
+# Резервные ключи Gemini, добавленные через /api
+extra_gemini_keys.txt
+
+# База данных
+*.db
+*.db-wal
+*.db-shm
+triage.db*
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# IDE / ОС
+.vscode/
+.idea/
+.DS_Store
