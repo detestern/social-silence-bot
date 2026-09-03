@@ -168,7 +168,7 @@ async def _handle_escalated(bot: Bot, adapter: TelegramAdapter, bot_id: int, use
         media = await adapter.download_media_bytes(job.channel_external_id, int(db_msg.external_id))
 
     async with get_session() as session:
-        context_text = await build_ai_context(session, user.id)
+        context_text = await build_ai_context(session, user.id, job.channel_group)
 
     try:
         important = await classify_single(

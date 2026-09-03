@@ -108,10 +108,43 @@ class Message(Base):
 
 
 class Profile(Base):
+    """Устаревшая модель — один общий блок текста без деления по группам.
+    Оставлена только для миграции старых данных в ProfileSection (см.
+    db/session.py); новый код её больше не пишет."""
     __tablename__ = "profile"
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     text: Mapped[str] = mapped_column(Text, default="")
+
+
+class ProfileSection(Base):
+    """Общий профиль пользователя — один блок текста (channel_group всегда
+    NULL). Оставлена как таблица с этой структурой ради простоты миграции;
+    по сути используется как одна строка на пользователя."""
+    __tablename__ = "profile_sections"
+    __table_args__ = (UniqueConstraint("user_id", "channel_group"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    channel_group: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+
+
+class School(Base):
+    """Школа — замена тегов: и группа чатов (Channel.group_label == name),
+    и область действия правил (PriorityRule.channel_group == name), и
+    контейнер под свой скрытый профиль. computed_profile — то, что реально
+    уходит в промпт для сообщений из этой школы: результат прогона общего
+    /profile через ИИ с инструкцией "оставь общее + то, что про эту школу".
+    Пересчитывается при создании школы и при каждом изменении /profile."""
+    __tablename__ = "schools"
+    __table_args__ = (UniqueConstraint("user_id", "name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    name: Mapped[str] = mapped_column(String(128))
+    computed_profile: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    computed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class PriorityRule(Base):

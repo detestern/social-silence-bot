@@ -1,5 +1,5 @@
 """
-Команды settings-бота: /chats, /find, /tag, /profile, /add_rule, /rules
+Команды settings-бота: /chats, /find, /school, /profile, /add_rule, /rules
 и остальное — см. описания в /start.
 """
 from datetime import datetime, timedelta
@@ -24,8 +24,9 @@ from core.rules_parser import parse_rule_text
 from core.scheduler import debug_full_analysis
 from core.digest import debug_daily_digest_now
 from core.classifier import add_extra_keys
+from core.schools import recompute_all_schools, recompute_school_profile
 from core.timeutil import today_start_utc_naive
-from db.models import Channel, Message, PriorityRule, Profile, Source, User
+from db.models import Channel, Message, PriorityRule, ProfileSection, School, Source, User
 from db.session import SOURCE_CODES, get_session
 
 router = Router()
@@ -40,7 +41,7 @@ PLATFORM_LABELS = {
     "yandex_mail": "Яндекс.Почта",
 }
 
-# Выбранная платформа для /chats, /find, /tag и т.д. — по её settings-чату.
+# Выбранная платформа для /chats, /find, /school и т.д. — по её settings-чату.
 # Дефолт telegram; переключение через /platform.
 _CURRENT_PLATFORM: dict[int, str] = {}
 
@@ -131,7 +132,7 @@ async def cmd_start(message: Message):
         "2. /chats — выбрать, какие чаты вообще присматривать\n"
         "3. Написать /start отдельному боту-уведомителю — туда будут прилетать самые важные вещи\n"
         "4. /profile — пара слов о себе (кто ты, что ведёшь), чтобы бот понимал, что тебя касается\n"
-        "5. /tag и /add_rule — по желанию, для особых случаев вроде временной ответственности за что-то\n\n"
+        "5. /school и /add_rule — по желанию, для особых случаев вроде временной ответственности за что-то\n\n"
         "Весь список команд — через «/» рядом с полем ввода. Если что-то непонятно — просто спроси у Никиты 💛"
     )
 
@@ -140,6 +141,10 @@ class LoginStates(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
     waiting_password = State()
+
+
+class SchoolStates(StatesGroup):
+    waiting_name = State()
 
 
 @router.message(Command("login"))
@@ -272,7 +277,7 @@ async def cmd_platform(message: Message):
         rows.append([InlineKeyboardButton(text=f"{mark}{label}{suffix}", callback_data=f"platform:{code}")])
 
     await message.answer(
-        f"Сейчас /chats, /tag, /add_rule и остальное применяются к: {PLATFORM_LABELS.get(current, current)} 🌸\n"
+        f"Сейчас /chats, /school, /add_rule и остальное применяются к: {PLATFORM_LABELS.get(current, current)} 🌸\n"
         "Выбери другую платформу:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -363,68 +368,108 @@ async def cmd_monitored(message: Message):
     )
 
 
-@router.message(Command("tag"))
-async def cmd_tag(message: Message, command: CommandObject):
-    tag_text = (command.args or "").strip()
-    if not tag_text:
-        await message.answer(
-            "Напиши так: /tag Школа №5 — потом отметь, какие отслеживаемые чаты сюда относятся.\n\n"
-            "Дальше в /add_rule можно будет выбрать эту группу как область действия правила, "
-            "не тыкая чаты заново 💛"
-        )
-        return
+@router.message(Command("school"))
+async def cmd_school(message: Message, state: FSMContext):
+    await state.set_state(SchoolStates.waiting_name)
+    await message.answer("Как называется школа? Просто пришли название 🌸 (/cancel — если передумаешь)")
+
+
+@router.message(StateFilter(SchoolStates.waiting_name))
+async def school_got_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    await state.clear()
 
     async with get_session() as session:
         user = await _get_or_create_user(session, message.chat.id)
-        all_channels = await _all_channels(session, user, _current_platform(message.chat.id))
+        existing = (await session.execute(
+            select(School).where(School.user_id == user.id, School.name == name)
+        )).scalar_one_or_none()
+        if existing:
+            await message.answer(
+                f'Школа «{name}» уже есть — используй /schools, чтобы посмотреть, '
+                "или выбери другое название."
+            )
+            return
+        school = School(user_id=user.id, name=name, computed_profile=None)
+        session.add(school)
+        await session.commit()
+        await session.refresh(school)
 
-    monitored = _apply_mode(all_channels, "g", None)
-    if not monitored:
-        await message.answer("Сначала выбери хотя бы один чат на мониторинг через /chats.")
-        return
+    rows = []
+    for code in SOURCE_CODES:
+        label = PLATFORM_LABELS.get(code, code)
+        suffix = "" if code in ADAPTERS else " (скоро)"
+        rows.append([InlineKeyboardButton(text=f"{label}{suffix}", callback_data=f"schoolplat:{school.id}:{code}")])
 
-    _ACTIVE_VIEW[message.chat.id] = ("g", tag_text)
     await message.answer(
-        f'Отметь, какие чаты относятся к группе «{tag_text}» (тап переключает; '
-        f"чат может состоять только в одной группе — повторный тег заменит прежний):",
-        reply_markup=channels_keyboard(
-            monitored, page=0, finish_label=_finish_label("g"),
-            is_checked=lambda c: c.group_label == tag_text,
-        ),
+        f'Школа «{name}» создана. С какой платформы подтянуть чаты для неё?',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
-@router.message(Command("tags"))
-async def cmd_tags(message: Message):
-    """Показывает все группы-теги и какие чаты в них входят — чтобы не
-    держать в голове, что куда отнесено, когда правил уже накопилось много."""
-    async with get_session() as session:
-        user = await _get_or_create_user(session, message.chat.id)
-        all_channels = await _all_channels(session, user, _current_platform(message.chat.id))
+@router.callback_query(F.data.startswith("schoolplat:"))
+async def cb_school_platform(callback: CallbackQuery):
+    _, school_id_str, code = callback.data.split(":")
+    school_id = int(school_id_str)
+    label = PLATFORM_LABELS.get(code, code)
 
-    monitored = [c for c in all_channels if c.is_monitored]
-    if not monitored:
-        await message.answer("Пока нет ни одного отслеживаемого чата 🌸 Набери /chats, чтобы выбрать.")
+    if code not in ADAPTERS:
+        await callback.answer(f"{label} пока не подключена — скоро будет 🌸", show_alert=True)
         return
 
-    grouped: dict[str, list[str]] = {}
-    ungrouped: list[str] = []
-    for c in monitored:
-        title = c.title or c.external_id
-        if c.group_label:
-            grouped.setdefault(c.group_label, []).append(title)
-        else:
-            ungrouped.append(title)
+    async with get_session() as session:
+        school = await session.get(School, school_id)
+        user = await _get_or_create_user(session, callback.message.chat.id)
+        all_channels = await _all_channels(session, user, code)
+
+    monitored = _apply_mode(all_channels, "g", None)
+    if not monitored:
+        await callback.message.edit_text(
+            f"В {label} пока нет ни одного отслеживаемого чата — сначала /chats, потом заново /school."
+        )
+        await callback.answer()
+        return
+
+    _ACTIVE_VIEW[callback.message.chat.id] = ("g", school.name)
+    _SCHOOL_WIZARD[callback.message.chat.id] = school.id
+    finish_label, finish_callback = _finish_meta(callback.message.chat.id, "g")
+
+    await callback.message.edit_text(
+        f'Отметь ✅, какие чаты относятся к «{school.name}» (чат может быть только в одной школе):',
+    )
+    await callback.message.answer(
+        "Выбирай чаты:",
+        reply_markup=channels_keyboard(
+            monitored, page=0, finish_label=finish_label, finish_callback=finish_callback,
+            is_checked=lambda c: c.group_label == school.name,
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(Command("schools"))
+async def cmd_schools(message: Message):
+    async with get_session() as session:
+        user = await _get_or_create_user(session, message.chat.id)
+        schools = (await session.execute(select(School).where(School.user_id == user.id))).scalars().all()
+        all_channels = await _all_channels(session, user, _current_platform(message.chat.id))
+
+    if not schools:
+        await message.answer("Пока нет ни одной школы 🌸 /school — чтобы создать.")
+        return
 
     lines = []
-    for tag in sorted(grouped):
-        lines.append(f"🏷 {tag}")
-        lines.extend(f"   • {t}" for t in grouped[tag])
-    if ungrouped:
-        lines.append("Без группы:")
-        lines.extend(f"   • {t}" for t in ungrouped)
+    for s in schools:
+        chats = [c.title or c.external_id for c in all_channels if c.is_monitored and c.group_label == s.name]
+        status = "профиль готов ✅" if s.computed_profile else "профиль ещё не посчитан ⏳"
+        block = f"🏫 {s.name} ({status})"
+        if chats:
+            block += "\n" + "\n".join(f"   • {t}" for t in chats)
+        else:
+            block += "\n   (нет привязанных чатов)"
+        lines.append(block)
 
-    await message.answer("\n".join(lines))
+    await message.answer("\n\n".join(lines))
 
 
 @router.message(Command("stats"))
@@ -457,6 +502,18 @@ async def cmd_stats(message: Message):
 
 
 
+# chat_id -> school_id, пока идёт выбор чатов для новой/редактируемой школы
+_SCHOOL_WIZARD: dict[int, int] = {}
+
+
+def _finish_meta(chat_id: int, mode: str) -> tuple[str, str]:
+    if mode == "g":
+        school_id = _SCHOOL_WIZARD.get(chat_id)
+        if school_id is not None:
+            return "✔️ Готово, посчитать профиль", f"school_finish:{school_id}"
+    return _finish_label(mode), "done"
+
+
 @router.callback_query(F.data.startswith("toggle:"))
 async def cb_toggle(callback: CallbackQuery):
     _, channel_id, page = callback.data.split(":")
@@ -486,9 +543,10 @@ async def cb_toggle(callback: CallbackQuery):
         await callback.answer("Обновлено")
         return
 
+    finish_label, finish_callback = _finish_meta(callback.message.chat.id, mode)
     await callback.message.edit_reply_markup(
         reply_markup=channels_keyboard(
-            filtered, page=page, finish_label=_finish_label(mode), is_checked=is_checked
+            filtered, page=page, finish_label=finish_label, finish_callback=finish_callback, is_checked=is_checked
         )
     )
     await callback.answer("Обновлено")
@@ -506,9 +564,10 @@ async def cb_page(callback: CallbackQuery):
     filtered = _apply_mode(channels, mode, query)
     is_checked = (lambda c: c.group_label == query) if mode == "g" else None
 
+    finish_label, finish_callback = _finish_meta(callback.message.chat.id, mode)
     await callback.message.edit_reply_markup(
         reply_markup=channels_keyboard(
-            filtered, page=page, finish_label=_finish_label(mode), is_checked=is_checked
+            filtered, page=page, finish_label=finish_label, finish_callback=finish_callback, is_checked=is_checked
         )
     )
     await callback.answer()
@@ -517,8 +576,27 @@ async def cb_page(callback: CallbackQuery):
 @router.callback_query(F.data == "done")
 async def cb_done(callback: CallbackQuery):
     _ACTIVE_VIEW.pop(callback.message.chat.id, None)
-    await callback.message.edit_text("Готово 🌸 /chats, /monitored или /tag — чтобы посмотреть ещё раз.")
+    await callback.message.edit_text("Готово 🌸 /chats, /monitored или /school — чтобы посмотреть ещё раз.")
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("school_finish:"))
+async def cb_school_finish(callback: CallbackQuery):
+    school_id = int(callback.data.split(":")[1])
+    _ACTIVE_VIEW.pop(callback.message.chat.id, None)
+    _SCHOOL_WIZARD.pop(callback.message.chat.id, None)
+
+    await callback.message.edit_text("Считаю профиль для этой школы… 🌸")
+    await callback.answer()
+
+    ok = await recompute_school_profile(school_id)
+    if ok:
+        await callback.message.answer("✅ Готово, школа настроена и профиль посчитан. /schools — посмотреть все.")
+    else:
+        await callback.message.answer(
+            "Чаты сохранила, а вот профиль пока не посчитала (например, /profile ещё пустой) — "
+            "как только заполнишь /profile, я пересчитаю всё автоматически."
+        )
 
 
 @router.callback_query(F.data == "noop")
@@ -592,43 +670,47 @@ async def cb_settings_done(callback: CallbackQuery):
 async def cmd_profile(message: Message, command: CommandObject):
     async with get_session() as session:
         user = await _get_or_create_user(session, message.chat.id)
-        profile = await session.get(Profile, user.id)
+        section = (await session.execute(
+            select(ProfileSection).where(ProfileSection.user_id == user.id, ProfileSection.channel_group.is_(None))
+        )).scalar_one_or_none()
 
         if not command.args:
-            text = profile.text.strip() if profile and profile.text else None
+            text = section.text.strip() if section and section.text else None
             if text:
                 await message.answer(f"Вот что сейчас записано о тебе:\n\n{text}\n\nЧтобы поменять: /profile новый текст")
             else:
                 await message.answer(
                     "Про тебя пока ничего не записано 🌸\n\n"
-                    "Напиши так: /profile Учитель химии, ведёт 10 и 11 классы в нескольких школах и в университете."
+                    "Напиши так: /profile Учитель химии, ведёт 10 и 11 классы в нескольких школах."
                 )
             return
 
         new_text = command.args.strip()
-        if profile is None:
-            session.add(Profile(user_id=user.id, text=new_text))
+        if section is None:
+            session.add(ProfileSection(user_id=user.id, channel_group=None, text=new_text))
         else:
-            profile.text = new_text
+            section.text = new_text
         await session.commit()
 
-    await message.answer("✅ Записала, спасибо!")
+    await message.answer("Записала, спасибо! Секунду, обновляю профиль по школам… 🌸")
+    await recompute_all_schools(user.id)
+    await message.answer("✅ Готово — профиль по всем школам пересчитан.")
 
 
 def _rule_confirmation(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     draft = _PENDING_RULES[chat_id]
     expiry_label = draft["expiry_label"]
-    group_label = draft["group"] or "Все чаты"
+    group_label = draft["group"] or "Все школы"
 
     text = (
         f'Поняла: «{draft["text"]}»\n'
-        f"Группа чатов: {group_label}\n"
+        f"Школа: {group_label}\n"
         f"Истекает: {expiry_label}\n\n"
         "Проверь и сохрани, или поменяй параметры кнопками ниже 🌸"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⏳ Срок: {expiry_label}", callback_data="ruleexp")],
-        [InlineKeyboardButton(text=f"🏷 Группа: {group_label}", callback_data="rulegrp")],
+        [InlineKeyboardButton(text=f"🏫 Школа: {group_label}", callback_data="rulegrp")],
         [
             InlineKeyboardButton(text="💾 Сохранить", callback_data="rulesave"),
             InlineKeyboardButton(text="❌ Отмена", callback_data="rulecancel"),
@@ -648,8 +730,8 @@ async def cmd_add_rule(message: Message, command: CommandObject):
 
     async with get_session() as session:
         user = await _get_or_create_user(session, message.chat.id)
-        all_channels = await _all_channels(session, user, _current_platform(message.chat.id))
-    groups = sorted({c.group_label for c in all_channels if c.group_label})
+        schools = (await session.execute(select(School).where(School.user_id == user.id))).scalars().all()
+    groups = sorted(s.name for s in schools)
 
     days = parsed.get("expires_in_days")
     expiry_label = next((label for d, label in _EXPIRY_CYCLE if d == days), f"{days} дн." if days else "Навсегда")
@@ -659,7 +741,7 @@ async def cmd_add_rule(message: Message, command: CommandObject):
         "expiry_days": days,
         "expiry_label": expiry_label,
         "group": None,
-        "group_cycle": ["Все чаты"] + groups,
+        "group_cycle": ["Все школы"] + groups,
     }
 
     text, kb = _rule_confirmation(message.chat.id)
@@ -690,10 +772,10 @@ async def cb_rule_group(callback: CallbackQuery):
         await callback.answer("Ой, черновик уже не активен — начни заново через /add_rule 🌸", show_alert=True)
         return
     cycle = draft["group_cycle"]
-    current = draft["group"] or "Все чаты"
+    current = draft["group"] or "Все школы"
     idx = cycle.index(current) if current in cycle else 0
     next_choice = cycle[(idx + 1) % len(cycle)]
-    draft["group"] = None if next_choice == "Все чаты" else next_choice
+    draft["group"] = None if next_choice == "Все школы" else next_choice
 
     text, kb = _rule_confirmation(callback.message.chat.id)
     await callback.message.edit_text(text, reply_markup=kb)
@@ -741,23 +823,62 @@ async def cb_rule_cancel(callback: CallbackQuery):
 async def cmd_rules(message: Message):
     async with get_session() as session:
         user = await _get_or_create_user(session, message.chat.id)
+        schools = (await session.execute(
+            select(School).where(School.user_id == user.id).order_by(School.name)
+        )).scalars().all()
         rules = (await session.execute(
             select(PriorityRule).where(PriorityRule.user_id == user.id, PriorityRule.is_active == True)  # noqa: E712
         )).scalars().all()
 
-    if not rules:
-        await message.answer("Активных правил пока нет 🌸 /add_rule текст — чтобы добавить.")
+    if not schools and not rules:
+        await message.answer("Пока пусто 🌸 /school — чтобы создать школу, /add_rule — чтобы добавить правило.")
         return
 
-    rows = []
-    lines = ["Вот что сейчас активно:\n"]
-    for r in rules:
-        group = r.channel_group or "все чаты"
-        expiry = r.expires_at.strftime("%d.%m") if r.expires_at else "бессрочно"
-        lines.append(f"• {r.text} [{group}, до {expiry}]")
-        rows.append([InlineKeyboardButton(text=f"❌ {r.text[:45]}", callback_data=f"delrule:{r.id}")])
+    now = datetime.utcnow()
 
-    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    def _rule_line(num: int, r: PriorityRule) -> str:
+        if r.expires_at:
+            days_left = max((r.expires_at.date() - now.date()).days, 0)
+            when = f"⏳ до {r.expires_at.strftime('%d.%m')} (ещё {days_left} дн.)"
+        else:
+            when = "♾ бессрочно"
+        return f"{num}. «{r.text}» — {when}"
+
+    rules_by_school: dict[str | None, list[PriorityRule]] = {}
+    for r in rules:
+        rules_by_school.setdefault(r.channel_group, []).append(r)
+
+    blocks = []
+    rows = []
+    counter = 0
+
+    for school in schools:
+        lines = [f"🏫 {school.name}"]
+        if school.computed_profile:
+            lines.append(f"📄 Базовое (из профиля):\n{school.computed_profile}")
+        else:
+            lines.append("📄 Базовое: профиль ещё не посчитан — обнови /profile или пересоздай школу")
+
+        for r in rules_by_school.pop(school.name, []):
+            counter += 1
+            lines.append(_rule_line(counter, r))
+            rows.append([InlineKeyboardButton(text=f"❌ Удалить №{counter}", callback_data=f"delrule:{r.id}")])
+
+        blocks.append("\n\n".join(lines))
+
+    global_rules = rules_by_school.pop(None, [])
+    if global_rules:
+        lines = ["🌐 Все школы"]
+        for r in global_rules:
+            counter += 1
+            lines.append(_rule_line(counter, r))
+            rows.append([InlineKeyboardButton(text=f"❌ Удалить №{counter}", callback_data=f"delrule:{r.id}")])
+        blocks.append("\n\n".join(lines))
+
+    await message.answer(
+        "📋 Активные правила:\n\n" + "\n\n---\n\n".join(blocks),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+    )
 
 
 @router.callback_query(F.data.startswith("delrule:"))

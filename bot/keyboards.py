@@ -14,10 +14,14 @@ def channels_keyboard(
     channels: list,
     page: int,
     finish_label: str = "✔️ Готово",
+    finish_callback: str = "done",
     is_checked: Optional[Callable[[object], bool]] = None,
 ) -> InlineKeyboardMarkup:
     """channels — отфильтрованный список Channel. is_checked — чем считать
     чат отмеченным (по умолчанию is_monitored; для 'g' — group_label==query).
+    finish_callback — что происходит по кнопке завершения; по умолчанию
+    просто "готово", но мастер создания школы подставляет свой (нужно ещё
+    пересчитать её профиль после выбора чатов).
     callback_data несёт только id чата и страницу, режим достаётся из
     _ACTIVE_VIEW по chat_id."""
     is_checked = is_checked or (lambda c: c.is_monitored)
@@ -42,6 +46,6 @@ def channels_keyboard(
     if nav:
         rows.append(nav)
 
-    rows.append([InlineKeyboardButton(text=finish_label, callback_data="done")])
+    rows.append([InlineKeyboardButton(text=finish_label, callback_data=finish_callback)])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)

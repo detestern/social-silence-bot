@@ -1,8 +1,11 @@
 """
-Разбирает накопленные tier='hourly' сообщения батчем через ИИ (курсор в
+Разбирает накопленные tier='hourly' сообщения через ИИ (курсор в
 processing_cursors двигается после каждого прогона) и уведомляет по
-важным — поштучно, не одним текстом, потому что у каждого своя ссылка
-на чат или пересылка.
+важным — поштучно, потому что у каждого своя ссылка на чат или пересылка.
+
+Раз у каждой школы свой скрытый профиль (School.computed_profile), пачка
+делится на подпачки по школам (плюс одна — для сообщений без школы) и
+каждая идёт отдельным запросом к ИИ со своим контекстом.
 """
 import asyncio
 import logging
@@ -37,7 +40,7 @@ async def _get_cursor(session, user_id: int, cursor_type: str) -> ProcessingCurs
 
 
 async def _channel_meta(session) -> dict:
-    """channel.id -> (title, group_label, kind, external_id)."""
+    """channel.id -> (title, group_label/школа, kind, external_id)."""
     rows = (await session.execute(select(Channel))).scalars().all()
     return {c.id: (c.title or "?", c.group_label, c.kind, c.external_id) for c in rows}
 
@@ -56,6 +59,26 @@ async def _build_items(pending: list[Message], meta: dict, adapter: TelegramAdap
             sender_name=m.sender_name, text=m.text or "", media=media,
         ))
     return items
+
+
+async def _classify_grouped_by_school(
+    user_id: int, pending: list[Message], meta: dict, adapter: TelegramAdapter
+) -> set[int]:
+    """Делит pending по школе (channel_group) и классифицирует каждую
+    группу отдельным запросом со своим контекстом (school.computed_profile).
+    Сообщения без школы — своей отдельной группой с общим /profile."""
+    groups: dict = {}
+    for m in pending:
+        _title, school_name, _kind, _ext = meta.get(m.channel_id, ("?", None, "group", ""))
+        groups.setdefault(school_name, []).append(m)
+
+    important_ids: set[int] = set()
+    for school_name, msgs in groups.items():
+        items = await _build_items(msgs, meta, adapter)
+        async with get_session() as session:
+            context_text = await build_ai_context(session, user_id, school_name)
+        important_ids |= await classify_batch(context_text, items)
+    return important_ids
 
 
 async def _notify_batch_results(
@@ -105,14 +128,12 @@ async def _run_hourly_batch_once(bot: Bot, adapter: TelegramAdapter, bot_id: int
     logger.info("Часовой батч: обрабатываю %d сообщений.", len(pending))
 
     async with get_session() as session:
-        context_text = await build_ai_context(session, user.id)
         meta = await _channel_meta(session)
 
-    items = await _build_items(pending, meta, adapter)
     max_id = max(m.id for m in pending)
 
     try:
-        important_ids = await classify_batch(context_text, items)
+        important_ids = await _classify_grouped_by_school(user.id, pending, meta, adapter)
     except ClassifierError:
         # Курсор двигаем всё равно — иначе застрянем на этой пачке навсегда.
         await bot.send_message(
@@ -176,13 +197,10 @@ async def debug_full_analysis(bot: Bot, adapter: TelegramAdapter, bot_id: int) -
         return
 
     async with get_session() as session:
-        context_text = await build_ai_context(session, user.id)
         meta = await _channel_meta(session)
 
-    items = await _build_items(pending, meta, adapter)
-
     try:
-        important_ids = await classify_batch(context_text, items)
+        important_ids = await _classify_grouped_by_school(user.id, pending, meta, adapter)
     except ClassifierError as exc:
         await bot.send_message(user.tg_notify_chat_id, f"⚠️ Тестовый прогон не удался: {exc}")
         return

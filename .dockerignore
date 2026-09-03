@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+*.session
+*.session-journal
+triage.db*
+extra_gemini_keys.txt
+data/
+README.md
+logo.jpg

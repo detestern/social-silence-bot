@@ -21,7 +21,8 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "gemini-3.6-flash"
-EXTRA_KEYS_PATH = Path(__file__).resolve().parent.parent / "extra_gemini_keys.txt"
+_default_extra_keys_path = Path(__file__).resolve().parent.parent / "extra_gemini_keys.txt"
+EXTRA_KEYS_PATH = Path(os.environ.get("EXTRA_GEMINI_KEYS_PATH", str(_default_extra_keys_path)))
 
 _clients: list[genai.Client] = []
 _keys: list[str] = []  # для проверки дублей при добавлении новых
@@ -128,6 +129,25 @@ async def transcribe_audio(data: bytes, mime_type: str) -> str:
         types.Part.from_bytes(data=data, mime_type=mime_type),
     ]
     raw = await _call_model(contents)
+    return raw.strip()
+
+
+async def extract_school_profile(base_profile_text: str, school_name: str) -> str:
+    """Из общего /profile вычленяет скрытый профиль под конкретную школу:
+    общая информация (имя, профессия и т.п.) + только то, что относится к
+    этой школе, без упоминаний других школ. Пересчитывается при создании
+    школы и при каждом изменении /profile."""
+    prompt = f"""Ниже — полное описание пользователя (может касаться нескольких школ/мест работы сразу).
+
+{base_profile_text}
+
+Составь версию этого описания ТОЛЬКО для школы «{school_name}»: оставь общую
+информацию, которая касается пользователя в целом (имя, профессия, предмет
+и т.п.), и ту часть, что относится именно к «{school_name}» (классы,
+обязанности, роли). Полностью убери всё, что относится к другим
+школам/местам. Верни только итоговый текст, без пояснений, кавычек и
+markdown-разметки."""
+    raw = await _call_model(prompt)
     return raw.strip()
 
 
