@@ -10,7 +10,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./triage.db")
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-SOURCE_CODES = ["telegram", "pachca", "gmail", "yandex_mail"]
+SOURCE_CODES = ["telegram", "pachca", "yandex_mail"]
 
 
 if DATABASE_URL.startswith("sqlite"):

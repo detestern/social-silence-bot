@@ -6,6 +6,7 @@
 упавший пропускается. add_extra_keys() добавляет резервные ключи на лету
 (команда /api), сохраняя их в extra_gemini_keys.txt на случай перезапуска.
 """
+import asyncio
 import itertools
 import json
 import logging
@@ -110,7 +111,13 @@ async def _call_model(contents: Union[str, list]) -> str:
     for offset in range(n):
         idx = (start + offset) % n
         try:
-            response = _clients[idx].models.generate_content(model=MODEL_NAME, contents=contents)
+            # generate_content — синхронный, блокирующий вызов (SDK не
+            # asyncio-friendly из коробки). Без to_thread он бы стопорил
+            # ВЕСЬ event loop на время запроса — все боты, слушатели,
+            # даже обработку Ctrl+C, — не только эту конкретную задачу.
+            response = await asyncio.to_thread(
+                _clients[idx].models.generate_content, model=MODEL_NAME, contents=contents
+            )
             return response.text
         except Exception as exc:
             logger.warning("Gemini-ключ #%d не сработал (%s), пробую следующий", idx + 1, exc)

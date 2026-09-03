@@ -177,11 +177,8 @@ async def _handle_escalated(bot: Bot, adapter: TelegramAdapter, bot_id: int, use
     except ClassifierError:
         await notify_important(
             bot, adapter, user.tg_notify_chat_id, bot_id,
-            "😳 Ой, ключи Gemini закончились — не смогла прогнать через ИИ срочное на вид сообщение. "
-            "Напиши скорее Никите, чтобы он прислал новые (через команду /api).\n\n"
-            "Проверь на всякий случай сама:\n"
-            f"Время: {format_time(db_msg.sent_at)}\nЧат: {job.channel_title}\n"
-            f"От: {db_msg.sender_name or '—'}\n{(db_msg.text or '')[:300]}",
+            "😳 Ключи Gemini закончились — не смогла проверить это сообщение. Напиши Никите (/api).\n\n"
+            f"Время: {format_time(db_msg.sent_at)}\nЧат: {job.channel_title}\nОт: {db_msg.sender_name or '—'}",
             job.channel_external_id, job.channel_kind, db_msg.external_id,
         )
         return
@@ -193,12 +190,10 @@ async def _handle_escalated(bot: Bot, adapter: TelegramAdapter, bot_id: int, use
         await session.commit()
 
     if important:
-        preview = (db_msg.text or "")[:300]
         await notify_important(
             bot, adapter, user.tg_notify_chat_id, bot_id,
-            "🔔 Важно (проверено ИИ вне очереди):\n\n"
-            f"Время: {format_time(db_msg.sent_at)}\nЧат: {job.channel_title}\n"
-            f"От: {db_msg.sender_name or '—'}\n{preview}",
+            "🔔 Важно\n\n"
+            f"Время: {format_time(db_msg.sent_at)}\nЧат: {job.channel_title}\nОт: {db_msg.sender_name or '—'}",
             job.channel_external_id, job.channel_kind, db_msg.external_id,
         )
 
@@ -250,11 +245,10 @@ async def _finalize_and_notify(
     logger.info("Финализировано (tier=%s) сообщение id=%s из чата %s", tier, db_msg.id, channel_external_id)
 
     if tier == "instant":
-        preview = (text or "")[:300]
         await notify_important(
             bot, adapter, user.tg_notify_chat_id, bot_id,
-            "⚡️ Похоже, важно (реплай/упоминание/личка — без ИИ):\n\n"
-            f"Время: {format_time(db_msg.sent_at)}\nОт: {db_msg.sender_name or '—'}\n{preview}",
+            "⚡️ Важно\n\n"
+            f"Время: {format_time(db_msg.sent_at)}\nЧат: {channel_title}\nОт: {db_msg.sender_name or '—'}",
             channel_external_id, channel_kind, db_msg.external_id,
         )
     elif tier == "escalated":

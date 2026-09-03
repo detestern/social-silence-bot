@@ -94,6 +94,16 @@ async def _notify_batch_results(
     for m in important:
         title, _group, kind, external_id = meta.get(m.channel_id, ("?", None, "group", ""))
         preview = (m.text or "")[:300]
+
+        if kind == "mailbox":
+            # Почта — не Telegram-сообщение, пересылать/давать ссылку некуда
+            # и незачем. Обычное сообщение боту, без notify_important.
+            await bot.send_message(
+                user.tg_notify_chat_id,
+                f"Время: {format_time(m.sent_at)}\nПочта\nПапка: {title}\nОт: {m.sender_name or '—'}\n{preview}",
+            )
+            continue
+
         await notify_important(
             bot, adapter, user.tg_notify_chat_id, bot_id,
             f"Время: {format_time(m.sent_at)}\nЧат: {title}\nОт: {m.sender_name or '—'}\n{preview}",

@@ -37,7 +37,6 @@ ADAPTERS: dict[str, SourceAdapter] = {}
 PLATFORM_LABELS = {
     "telegram": "Telegram",
     "pachca": "Пачка",
-    "gmail": "Gmail",
     "yandex_mail": "Яндекс.Почта",
 }
 
@@ -99,13 +98,29 @@ async def _sync_channels_from_platform(session, user: User, source_code: str) ->
     existing_by_ext_id = {c.external_id: c for c in existing}
     source = (await session.execute(select(Source).where(Source.code == source_code))).scalar_one()
 
+    # На случай если адаптер вернул дубль external_id в одном и том же
+    # списке (например, кривой парсинг у почтового адаптера) — не даём
+    # упасть на UNIQUE-constraint, просто берём первое вхождение.
+    seen_in_batch: set[str] = set()
     for d in discovered:
-        if d.external_id not in existing_by_ext_id:
-            session.add(Channel(
-                user_id=user.id, source_id=source.id,
-                external_id=d.external_id, title=d.title, kind=d.kind,
-                is_monitored=False,
-            ))
+        if d.external_id in seen_in_batch:
+            continue
+        seen_in_batch.add(d.external_id)
+
+        existing_channel = existing_by_ext_id.get(d.external_id)
+        if existing_channel is not None:
+            # Название могло измениться (переименовали чат/папку, или как
+            # тут — раньше сохранили нераскодированное имя) — обновляем.
+            if existing_channel.title != d.title or existing_channel.kind != d.kind:
+                existing_channel.title = d.title
+                existing_channel.kind = d.kind
+            continue
+
+        session.add(Channel(
+            user_id=user.id, source_id=source.id,
+            external_id=d.external_id, title=d.title, kind=d.kind,
+            is_monitored=False,
+        ))
     await session.commit()
     return await _all_channels(session, user, source_code)
 

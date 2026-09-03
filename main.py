@@ -7,10 +7,12 @@ from aiogram.types import BotCommand
 from dotenv import load_dotenv
 
 from adapters.telegram import TelegramAdapter
+from adapters.yandex_mail import YandexMailAdapter
 from bot.alert_handlers import router as alert_router
 from bot.handlers import ADAPTERS, router as settings_router, set_alert_bot
 from bot.middleware import AllowedUsersMiddleware
 from core.listener import run_listener
+from core.mail_listener import run_mail_listener
 from core.scheduler import run_hourly_scheduler
 from core.digest import run_daily_digest_scheduler
 from db.session import init_db
@@ -51,12 +53,37 @@ def _make_dispatcher(router) -> Dispatcher:
     return dp
 
 
+async def _set_name_if_needed(bot: Bot, name: str) -> None:
+    """Меняет имя бота, только если оно реально отличается — иначе на
+    каждом перезапуске зря дёргаем setMyName, а у Telegram на него жёсткий
+    флуд-лимит (легко словить сутки блокировки метода при частых рестартах
+    во время отладки). Ошибку любого рода не считаем фатальной — имя не
+    критично для работы бота, роняться из-за него незачем."""
+    try:
+        current = await bot.get_my_name()
+        if current.name == name:
+            return
+        await bot.set_my_name(name)
+    except Exception:
+        logger.warning("Не удалось обновить имя бота (%s) — не критично, продолжаю", name, exc_info=True)
+
+
 async def main():
     await init_db()
 
     # Пока один источник — telegram. Другие адаптеры добавляются сюда же.
     telegram_adapter = TelegramAdapter()
     ADAPTERS["telegram"] = telegram_adapter
+
+    # Yandex.Почта — необязательна: подключаем, только если заданы логин и
+    # пароль приложения. Без них /platform просто покажет "скоро будет",
+    # ничего не падает.
+    yandex_adapter = None
+    if os.environ.get("YANDEX_MAIL_LOGIN") and os.environ.get("YANDEX_MAIL_APP_PASSWORD"):
+        yandex_adapter = YandexMailAdapter()
+        ADAPTERS["yandex_mail"] = yandex_adapter
+    else:
+        logger.info("YANDEX_MAIL_LOGIN/APP_PASSWORD не заданы — Яндекс.Почта пока не подключена.")
 
     # settings — команды и настройка, alert — только уведомления.
     settings_bot = Bot(token=os.environ["TG_BOT_TOKEN"])
@@ -66,8 +93,8 @@ async def main():
     alert_dp = _make_dispatcher(alert_router)
 
     await settings_bot.set_my_commands(SETTINGS_BOT_COMMANDS)
-    await settings_bot.set_my_name("Фемида")
-    await alert_bot.set_my_name("Ирида")
+    await _set_name_if_needed(settings_bot, "Фемида")
+    await _set_name_if_needed(alert_bot, "Ирида")
 
     alert_bot_id = (await alert_bot.get_me()).id
     # Нужен для пересылки через Telethon прямо в чат с alert-ботом — это
@@ -85,6 +112,10 @@ async def main():
     scheduler_task = asyncio.create_task(run_hourly_scheduler(alert_bot, telegram_adapter, alert_bot_id))
     digest_task = asyncio.create_task(run_daily_digest_scheduler(alert_bot, telegram_adapter, alert_bot_id))
     tasks = {settings_polling_task, alert_polling_task, listener_task, scheduler_task, digest_task}
+
+    if yandex_adapter is not None:
+        mail_task = asyncio.create_task(run_mail_listener(yandex_adapter))
+        tasks.add(mail_task)
 
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
