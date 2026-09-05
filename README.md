@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.jpg" alt="logo" width="200">
+  <img src="logo.JPG" alt="logo" width="400">
 </p>
 
 <h1 align="center">Triage Bot</h1>
