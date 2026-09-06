@@ -490,28 +490,41 @@ async def cmd_schools(message: Message):
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     """Короткий дашборд за сегодня: сколько сообщений пришло и сколько из
-    них признано важными, по каким чатам — просто чтобы видеть, что
+    них признано важными, по каким чатам/папкам — просто чтобы видеть, что
     система жива и вообще что-то делает, не заглядывая в терминал."""
     boundary = today_start_utc_naive()
     async with get_session() as session:
         rows = (await session.execute(
             select(Message).where(Message.sent_at >= boundary, Message.merged_into_id.is_(None))
         )).scalars().all()
-        channels = {c.id: (c.title or "?") for c in (await session.execute(select(Channel))).scalars().all()}
+        channels = {c.id: (c.title or "?", c.kind) for c in (await session.execute(select(Channel))).scalars().all()}
 
     if not rows:
         await message.answer("Сегодня сообщений ещё не было 🌸")
         return
 
     important_count = sum(1 for m in rows if m.importance)
-    by_channel: dict[str, int] = {}
-    for m in rows:
-        title = channels.get(m.channel_id, "?")
-        by_channel[title] = by_channel.get(title, 0) + 1
 
-    lines = [f"📊 За сегодня: {len(rows)} сообщений, из них важных — {important_count}.", "", "По чатам:"]
-    for title, count in sorted(by_channel.items(), key=lambda kv: -kv[1]):
-        lines.append(f"• {title}: {count}")
+    by_channel_tg: dict[str, int] = {}
+    by_channel_mail: dict[str, int] = {}
+    for m in rows:
+        title, kind = channels.get(m.channel_id, ("?", "group"))
+        target = by_channel_mail if kind == "mailbox" else by_channel_tg
+        target[title] = target.get(title, 0) + 1
+
+    lines = [f"📊 За сегодня: {len(rows)} сообщений, из них важных — {important_count}."]
+
+    if by_channel_tg:
+        lines.append("")
+        lines.append(f"Telegram ({sum(by_channel_tg.values())}):")
+        for title, count in sorted(by_channel_tg.items(), key=lambda kv: -kv[1]):
+            lines.append(f"• {title}: {count}")
+
+    if by_channel_mail:
+        lines.append("")
+        lines.append(f"Почта ({sum(by_channel_mail.values())}):")
+        for title, count in sorted(by_channel_mail.items(), key=lambda kv: -kv[1]):
+            lines.append(f"• {title}: {count}")
 
     await message.answer("\n".join(lines))
 
