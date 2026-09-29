@@ -220,6 +220,7 @@ class TelegramAdapter(SourceAdapter):
                     is_reply_to_user=is_reply_to_user,
                     is_direct_mention=is_mention,
                     has_media=has_media,
+                    is_own=(event.sender_id == self._me_id),
                     sent_at=event.message.date,
                     raw={"message_id": event.message.id, "chat_id": event.chat_id},
                 )

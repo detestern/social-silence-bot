@@ -96,21 +96,23 @@ async def _notify_batch_results(
 
         if kind == "mailbox":
             # Почта — не Telegram-сообщение, пересылать/давать ссылку некуда
-            # и незачем, поэтому превью тут оставляем — это единственное
-            # сообщение с содержимым письма, второго (пересылки) не будет.
-            preview = (m.text or "")[:300]
+            # и незачем — одно сообщение с полным текстом письма.
+            body = m.text or ""
+            if len(body) > 3500:
+                body = body[:3500].rstrip() + "…"
             await bot.send_message(
                 user.tg_notify_chat_id,
-                f"Время: {format_time(m.sent_at)}\nПочта\nПапка: {title}\nОт: {m.sender_name or '—'}\n{preview}",
+                f"Время: {format_time(m.sent_at)}\nПочта: {title}\nОт: {m.sender_name or '—'}\n\n{body}",
             )
             continue
 
-        # Для Telegram превью текста не нужно — секундой позже придёт
-        # пересылка оригинала (или кнопка-ссылка), дублировать нечего.
+        # Одно сообщение: шапка + текст + вложение (если было) — без
+        # отдельной пересылки оригинала.
         await notify_important(
-            bot, adapter, user.tg_notify_chat_id, bot_id,
+            bot, adapter, user.tg_notify_chat_id,
             f"Время: {format_time(m.sent_at)}\nЧат: {title}\nОт: {m.sender_name or '—'}",
-            external_id, kind, m.external_id,
+            m.text or "",
+            external_id, kind, m.external_id, m.has_media,
         )
 
 

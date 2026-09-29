@@ -227,6 +227,7 @@ class YandexMailAdapter(SourceAdapter):
                     is_reply_to_user=False,
                     is_direct_mention=False,
                     has_media=False,
+                    is_own=False,
                     sent_at=sent_at,
                     raw={"uid": uid, "folder": folder},
                 ))

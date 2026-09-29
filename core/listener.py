@@ -176,10 +176,11 @@ async def _handle_escalated(bot: Bot, adapter: TelegramAdapter, bot_id: int, use
         )
     except ClassifierError:
         await notify_important(
-            bot, adapter, user.tg_notify_chat_id, bot_id,
+            bot, adapter, user.tg_notify_chat_id,
             "😳 Ключи Gemini закончились — не смогла проверить это сообщение. Напиши Никите (/api).\n\n"
             f"Время: {format_time(db_msg.sent_at)}\nЧат: {job.channel_title}\nОт: {db_msg.sender_name or '—'}",
-            job.channel_external_id, job.channel_kind, db_msg.external_id,
+            db_msg.text or "",
+            job.channel_external_id, job.channel_kind, db_msg.external_id, db_msg.has_media,
         )
         return
 
@@ -191,10 +192,11 @@ async def _handle_escalated(bot: Bot, adapter: TelegramAdapter, bot_id: int, use
 
     if important:
         await notify_important(
-            bot, adapter, user.tg_notify_chat_id, bot_id,
+            bot, adapter, user.tg_notify_chat_id,
             "🔔 Важно\n\n"
             f"Время: {format_time(db_msg.sent_at)}\nЧат: {job.channel_title}\nОт: {db_msg.sender_name or '—'}",
-            job.channel_external_id, job.channel_kind, db_msg.external_id,
+            db_msg.text or "",
+            job.channel_external_id, job.channel_kind, db_msg.external_id, db_msg.has_media,
         )
 
 
@@ -246,10 +248,11 @@ async def _finalize_and_notify(
 
     if tier == "instant":
         await notify_important(
-            bot, adapter, user.tg_notify_chat_id, bot_id,
+            bot, adapter, user.tg_notify_chat_id,
             "⚡️ Важно\n\n"
             f"Время: {format_time(db_msg.sent_at)}\nЧат: {channel_title}\nОт: {db_msg.sender_name or '—'}",
-            channel_external_id, channel_kind, db_msg.external_id,
+            text,
+            channel_external_id, channel_kind, db_msg.external_id, has_media,
         )
     elif tier == "escalated":
         await escalated_queue.put(_EscalatedJob(db_msg, channel_external_id, channel_kind, channel_title, channel_group))
@@ -289,6 +292,17 @@ async def _process_one_message(
         await session.refresh(db_msg)
 
     logger.info("Сохранено сообщение id=%s из чата %s", db_msg.id, msg.channel_external_id)
+
+    if msg.is_own:
+        # Её собственное сообщение — не может быть "важным" самой для себя.
+        # Сохраняем как есть (для контекста в дневной сводке), но не
+        # пускаем ни в склейку обрывков, ни в оценку важности вообще —
+        # tier='own' исключён из часового батча (там фильтр по tier='hourly').
+        async with get_session() as session:
+            fresh = await session.get(Message, db_msg.id)
+            fresh.tier = "own"
+            await session.commit()
+        return
 
     word_count = len((msg.text or "").split())
     key = (channel_id, msg.sender_id) if msg.sender_id is not None else None

@@ -7,11 +7,13 @@
 (команда /api), сохраняя их в extra_gemini_keys.txt на случай перезапуска.
 """
 import asyncio
+import datetime as dt
 import itertools
 import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -22,12 +24,50 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "gemini-3.6-flash"
+
+# Резервные модели — пробуются по очереди, ТОЛЬКО когда основная модель
+# исчерпала дневную квоту на всех ключах. У другой модели в том же Google
+# Cloud проекте своя ОТДЕЛЬНАЯ квота (лимит "PerProjectPerModel"), поэтому
+# это реально добавляет бюджет, а не просто перебирает те же ключи.
+# Задаётся через .env: GEMINI_FALLBACK_MODELS=gemini-2.5-flash,gemini-2.5-flash-lite
+_fallback_models_raw = os.environ.get("GEMINI_FALLBACK_MODELS", "")
+MODELS: list[str] = [MODEL_NAME] + [m.strip() for m in _fallback_models_raw.split(",") if m.strip()]
+
 _default_extra_keys_path = Path(__file__).resolve().parent.parent / "extra_gemini_keys.txt"
 EXTRA_KEYS_PATH = Path(os.environ.get("EXTRA_GEMINI_KEYS_PATH", str(_default_extra_keys_path)))
 
 _clients: list[genai.Client] = []
 _keys: list[str] = []  # для проверки дублей при добавлении новых
 _key_cycle = None  # инициализируется лениво/пересоздаётся при изменении _clients
+
+# (индекс ключа, имя модели) -> дата (UTC), в которую эта пара упёрлась в
+# ДНЕВНУЮ квоту — пока дата совпадает с сегодняшней, пробовать бессмысленно
+# (сбрасывается само по себе на следующий день, ключ по дате не совпадёт).
+_exhausted_today: dict[tuple[int, str], "dt.date"] = {}
+
+# (индекс ключа, имя модели) -> time.monotonic(), до которого эта пара
+# "отдыхает" после ПОМИНУТНОГО (RPM) лимита — в отличие от дневной квоты,
+# это не навсегда, а секунд на 20-30, дальше снова можно пробовать.
+_cooldown_until: dict[tuple[int, str], float] = {}
+
+RPM_COOLDOWN_SECONDS = 25
+ALL_THROTTLED_RETRY_SECONDS = 12
+
+
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """ДНЕВНАЯ квота проекта кончилась — ждать бессмысленно вообще, нужна
+    другая модель или завтрашний день."""
+    msg = str(exc)
+    return "RESOURCE_EXHAUSTED" in msg and "PerDay" in msg
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Временный "Too Many Requests" (обычно поминутный RPM-лимит) — не
+    настоящее исчерпание, через секунды снова заработает. Отличаем от
+    дневной квоты (та уже поймана выше) и от прочих ошибок (503 и т.п.,
+    для них смысла в персональном "остывании" ключа нет)."""
+    msg = str(exc)
+    return "RESOURCE_EXHAUSTED" in msg or "429" in msg or "Too Many Requests" in msg
 
 
 def _rebuild_cycle() -> None:
@@ -100,29 +140,79 @@ class ClassifierError(Exception):
     код отличает так "не важно" от "не смогли спросить модель"."""
 
 
-async def _call_model(contents: Union[str, list]) -> str:
-    """Round-robin по ключам; contents — строка или список (текст вперемешку
-    с types.Part.from_bytes(...) для вложений/аудио)."""
+async def _call_model(contents: Union[str, list], _retried_after_throttle: bool = False) -> str:
+    """Round-robin по ключам для основной модели; если ВСЕ ключи упёрлись в
+    дневную квоту на ней — переходим к следующей модели из MODELS (у неё
+    своя отдельная квота на тех же проектах) и пробуем ключи заново.
+
+    Дневной лимит (PerDay) и поминутный (RPM/"Too Many Requests") — разные
+    вещи: дневной откладывает пару ключ+модель до завтра, поминутный — на
+    ~RPM_COOLDOWN_SECONDS. Если СРАЗУ ВСЕ попытки в этом вызове упёрлись
+    только в поминутный лимит (не в дневной и не в другую ошибку) — это
+    временный затор, а не "ключи кончились": ждём немного и пробуем весь
+    цикл ещё один раз, прежде чем сдаваться по-настоящему.
+
+    contents — строка или список (текст вперемешку с
+    types.Part.from_bytes(...) для вложений/аудио)."""
     _ensure_clients()
     n = len(_clients)
     start = next(_key_cycle)
+    today = dt.datetime.utcnow().date()
+    now = time.monotonic()
 
     last_exc: Optional[Exception] = None
-    for offset in range(n):
-        idx = (start + offset) % n
-        try:
-            # generate_content — синхронный, блокирующий вызов (SDK не
-            # asyncio-friendly из коробки). Без to_thread он бы стопорил
-            # ВЕСЬ event loop на время запроса — все боты, слушатели,
-            # даже обработку Ctrl+C, — не только эту конкретную задачу.
-            response = await asyncio.to_thread(
-                _clients[idx].models.generate_content, model=MODEL_NAME, contents=contents
-            )
-            return response.text
-        except Exception as exc:
-            logger.warning("Gemini-ключ #%d не сработал (%s), пробую следующий", idx + 1, exc)
-            last_exc = exc
-            continue
+    saw_failure = False
+    all_failures_were_throttle = True
+
+    for model in MODELS:
+        model_had_live_key = False
+        for offset in range(n):
+            idx = (start + offset) % n
+            if _exhausted_today.get((idx, model)) == today:
+                continue
+            if _cooldown_until.get((idx, model), 0.0) > now:
+                continue
+            model_had_live_key = True
+            try:
+                # generate_content — синхронный, блокирующий вызов (SDK не
+                # asyncio-friendly из коробки). Без to_thread он бы стопорил
+                # ВЕСЬ event loop на время запроса — все боты, слушатели,
+                # даже обработку Ctrl+C, — не только эту конкретную задачу.
+                response = await asyncio.to_thread(
+                    _clients[idx].models.generate_content, model=model, contents=contents
+                )
+                return response.text
+            except Exception as exc:
+                saw_failure = True
+                if _is_daily_quota_error(exc):
+                    _exhausted_today[(idx, model)] = today
+                    all_failures_were_throttle = False
+                    logger.warning(
+                        "Gemini-ключ #%d (%s) исчерпал дневную квоту, откладываю до завтра", idx + 1, model
+                    )
+                elif _is_rate_limit_error(exc):
+                    _cooldown_until[(idx, model)] = now + RPM_COOLDOWN_SECONDS
+                    logger.warning(
+                        "Gemini-ключ #%d (%s) словил Too Many Requests, отдыхает %d с.",
+                        idx + 1, model, RPM_COOLDOWN_SECONDS,
+                    )
+                else:
+                    all_failures_were_throttle = False
+                    logger.warning("Gemini-ключ #%d (%s) не сработал (%s), пробую следующий", idx + 1, model, exc)
+                last_exc = exc
+                continue
+        if not model_had_live_key:
+            logger.warning("У модели %s сейчас не осталось живых ключей (квота/остывают), пробую следующую модель", model)
+        elif model is not MODELS[-1]:
+            logger.warning("Все ключи не сработали на модели %s, пробую следующую модель", model)
+
+    if saw_failure and all_failures_were_throttle and not _retried_after_throttle:
+        logger.warning(
+            "Все ключи временно упёрлись в Too Many Requests — жду %d с. и пробую ещё раз, прежде чем сдаваться",
+            ALL_THROTTLED_RETRY_SECONDS,
+        )
+        await asyncio.sleep(ALL_THROTTLED_RETRY_SECONDS)
+        return await _call_model(contents, _retried_after_throttle=True)
 
     raise ClassifierError(str(last_exc))
 
@@ -180,6 +270,17 @@ async def classify_single(
 только если группа чата у сообщения совпадает с группой правила. Правила
 без указанной группы действуют на все чаты.
 
+Важно: если название чата само по себе указывает на тему (например, чат
+называется «Химия», «8-9 классы» или «Летово химия 26-27»), а сообщение
+просто касается этой же темы — само по себе это НЕ основание для
+важности. Раз весь чат и так посвящён этой теме, упоминание её там
+неинформативно (это как пометить важным любое сообщение в чате "Погода"
+только за то, что оно про погоду). Оценивай, требует ли сообщение
+реального личного участия, решения или действия получателя — а не
+формальное совпадение с её профилем. Обычная бытовая переписка
+(созвониться, зайти, спросить как дела, о чём-то узнать без конкретики)
+сама по себе не важна, даже если она про её предмет или класс.
+
 Это сообщение реально требует внимания получателя, или это фоновой шум
 (поздравления, обсуждения не касающихся её классов/тем, общие
 объявления не по делу)?
@@ -222,6 +323,16 @@ async def classify_batch(context_text: str, items: list[ClassifyBatchItem]) -> s
 группа — применяй такое правило, только если группы совпадают. Правила
 без указанной группы действуют на все чаты и сообщения независимо от их
 группы.
+
+Важно: если название чата само по себе указывает на тему (например, чат
+называется «Химия», «8-9 классы» или «Летово химия 26-27»), а сообщение
+просто касается этой же темы — само по себе это НЕ основание для
+важности. Раз весь чат и так посвящён этой теме, упоминание её там
+неинформативно. Оценивай, требует ли сообщение реального личного
+участия, решения или действия получателя — а не формальное совпадение с
+её профилем. Обычная бытовая переписка (созвониться, зайти, спросить как
+дела, о чём-то узнать без конкретики) сама по себе не важна, даже если
+она про её предмет или класс.
 
 Ниже — пачка сообщений за последний час, каждое с номером в квадратных
 скобках. У некоторых есть приложенный файл/фото — он идёт сразу после

@@ -28,6 +28,7 @@ class NormalizedMessage:
     is_reply_to_user: bool
     is_direct_mention: bool
     has_media: bool
+    is_own: bool  # написано самим владельцем сессии — никогда не может быть "важным"
     sent_at: datetime
     raw: dict
 
