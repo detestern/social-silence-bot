@@ -96,14 +96,18 @@ async def _notify_batch_results(
 
         if kind == "mailbox":
             # Почта — не Telegram-сообщение, пересылать/давать ссылку некуда
-            # и незачем — одно сообщение с полным текстом письма.
-            body = m.text or ""
+            # и незачем. Текст уже очищен от подписи/переписки на этапе
+            # разбора письма (adapters/yandex_mail.py); тема хранится первой
+            # строкой перед пустой строкой — разбираем обратно для "Тема:".
+            subject, sep, body = (m.text or "").partition("\n\n")
+            if not sep:
+                subject, body = "", m.text or ""
             if len(body) > 3500:
                 body = body[:3500].rstrip() + "…"
-            await bot.send_message(
-                user.tg_notify_chat_id,
-                f"Время: {format_time(m.sent_at)}\nПочта: {title}\nОт: {m.sender_name or '—'}\n\n{body}",
-            )
+            header = f"Время: {format_time(m.sent_at)}\nПочта: {title}\nОт: {m.sender_name or '—'}"
+            if subject:
+                header += f"\nТема: {subject}"
+            await bot.send_message(user.tg_notify_chat_id, f"{header}\n\n{body}")
             continue
 
         # Одно сообщение: шапка + текст + вложение (если было) — без

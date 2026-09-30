@@ -102,6 +102,64 @@ def _html_to_text(html: str) -> str:
     return html.strip()
 
 
+# Строка-разделитель перед процитированным/пересланным куском ("----------------").
+_FORWARD_SEPARATOR_RE = re.compile(r"^\s*-{3,}\s*$")
+# Яндекс.Почта вставляет перед цитатой строку вида:
+# 10.09.2026, 12:05, "Юлия Котова" <julia.kotova@letovo.ru>:
+_QUOTE_HEADER_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4},\s*\d{1,2}:\d{2},.*:\s*$")
+# Строка со списком получателей пересланного/процитированного письма.
+_RECIPIENTS_HEADER_RE = re.compile(r"^\s*(Кому|To)\s*:\s", re.IGNORECASE)
+# Начало подписи — если строка ЦЕЛИКОМ (плюс необязательная пунктуация после)
+# состоит из одной из этих фраз, всё, что дальше, — подпись (+ то, что под ней).
+_SIGNATURE_START_RE = re.compile(
+    r"^\s*(С\s+уважением|С\s+наилучшими\s+пожеланиями|Best\s+regards|Kind\s+regards|"
+    r"Warm\s+regards|Regards|Sincerely)\s*[,!.:]?\s*$",
+    re.IGNORECASE,
+)
+# Re:/Fwd:/Fw:/Ответ:/Пересылка: в начале темы — может повторяться несколько раз.
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fwd?|fw|ответ|пересылка)\s*:\s*", re.IGNORECASE)
+
+
+def _clean_subject(subject: str) -> str:
+    """Снимает Re:/Fwd:/Ответ: и т.п. префиксы (возможно, несколько подряд),
+    чтобы в уведомлении была голая тема письма."""
+    s = subject.strip()
+    while True:
+        new_s = _SUBJECT_PREFIX_RE.sub("", s)
+        if new_s == s:
+            return new_s
+        s = new_s
+
+
+def _clean_body(body: str) -> tuple[str, bool]:
+    """Отрезает подпись и процитированную/пересланную переписку — оставляет
+    только текст актуального сообщения. Ей не нужна ПОЛНАЯ переписка,
+    достаточно понять, что письмо важное, и пойти посмотреть остальное в
+    почте самой — поэтому возвращаем (чистый_текст, было_ли_что_вырезано):
+    второе используется, чтобы пометить "+ Пересланные письма"."""
+    lines = body.splitlines()
+    cut_at = len(lines)
+    for i, line in enumerate(lines):
+        if (
+            _SIGNATURE_START_RE.match(line)
+            or _FORWARD_SEPARATOR_RE.match(line)
+            or _QUOTE_HEADER_RE.match(line)
+            or _RECIPIENTS_HEADER_RE.match(line)
+        ):
+            cut_at = i
+            break
+
+    kept, removed = lines[:cut_at], lines[cut_at:]
+    has_forwarded = any(
+        _FORWARD_SEPARATOR_RE.match(l) or _QUOTE_HEADER_RE.match(l) or _RECIPIENTS_HEADER_RE.match(l)
+        for l in removed
+    )
+
+    cleaned = "\n".join(kept).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned, has_forwarded
+
+
 def _extract_text(msg) -> str:
     if msg.is_multipart():
         plain, html = None, None
@@ -205,11 +263,17 @@ class YandexMailAdapter(SourceAdapter):
                     continue
                 msg = email.message_from_bytes(msg_data[0][1])
 
-                subject = _decode_mime_words(msg.get("Subject", ""))
+                subject = _clean_subject(_decode_mime_words(msg.get("Subject", "")))
                 from_name, from_addr = email.utils.parseaddr(msg.get("From", ""))
                 from_name = _decode_mime_words(from_name) or from_addr
 
-                body = _extract_text(msg).strip()
+                body_raw = _extract_text(msg).strip()
+                body, has_forwarded = _clean_body(body_raw)
+                if has_forwarded:
+                    body = (body + "\n\n+ Пересланные письма").strip() if body else "+ Пересланные письма"
+                # subject хранится первой строкой (до первого "\n\n") — так
+                # core/scheduler.py разбирает её обратно для "Тема:" в
+                # уведомлении, без отдельной колонки в БД.
                 text = f"{subject}\n\n{body}" if subject else body
 
                 date_str = msg.get("Date")
