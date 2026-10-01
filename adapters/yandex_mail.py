@@ -119,6 +119,19 @@ _SIGNATURE_START_RE = re.compile(
 # Re:/Fwd:/Fw:/Ответ:/Пересылка: в начале темы — может повторяться несколько раз.
 _SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fwd?|fw|ответ|пересылка)\s*:\s*", re.IGNORECASE)
 
+# Приглашения Google Calendar (включая пересланные из Gmail) — своя структура:
+# после названия события и даты/времени идёт блок "Organizer"/"Guests" (список
+# гостей, часто огромный) и юридическая приписка про пересылку приглашений.
+# Эта служебная часть сама по себе не форвард/цитата, поэтому не помечаем её
+# как "+ Пересланные письма" — просто отрезаем.
+_CALENDAR_SECTION_RE = re.compile(r"^\s*(Organizer|Организатор|Guests|Гости)\s*$", re.IGNORECASE)
+_CALENDAR_FOOTER_RE = re.compile(
+    r"^\s*(Invitation from Google Calendar|Приглашение от Google Календар|"
+    r"You are receiving this email because|Вы получили это письмо|"
+    r"Forwarding this invitation could allow)",
+    re.IGNORECASE,
+)
+
 
 def _clean_subject(subject: str) -> str:
     """Снимает Re:/Fwd:/Ответ: и т.п. префиксы (возможно, несколько подряд),
@@ -145,6 +158,8 @@ def _clean_body(body: str) -> tuple[str, bool]:
             or _FORWARD_SEPARATOR_RE.match(line)
             or _QUOTE_HEADER_RE.match(line)
             or _RECIPIENTS_HEADER_RE.match(line)
+            or _CALENDAR_SECTION_RE.match(line)
+            or _CALENDAR_FOOTER_RE.match(line)
         ):
             cut_at = i
             break
