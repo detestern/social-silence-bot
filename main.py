@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 # Отключаем шумный INFO-лог aiogram на каждый апдейт — остальные логгеры без изменений.
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
+# Telethon пишет "Got difference for ..." на КАЖДОЕ обновление — в проде это
+# сотни строк в час. При ограниченной ротации логов Docker это вымывает из
+# истории реальные ошибки (например, из опроса почты) за считанные часы,
+# что уже мешало диагностике — поэтому глушим и этот логгер.
+logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+
 SETTINGS_BOT_COMMANDS = [
     BotCommand(command="start", description="Как пользоваться этим ботом"),
     BotCommand(command="login", description="Авторизовать чтение чатов"),

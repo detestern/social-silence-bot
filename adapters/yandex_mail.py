@@ -315,9 +315,21 @@ class YandexMailAdapter(SourceAdapter):
         finally:
             conn.logout()
 
+    # Короткий backoff после сбоя вместо ожидания полного интервала — быстрее
+    # приходим в норму после временной сетевой/IMAP заминки (растёт с числом
+    # подряд неудачных циклов, но не больше обычного интервала опроса).
+    FAILURE_RETRY_SECONDS = 15
+    # Раз в ~столько секунд пишем "жив" в лог, даже если новых писем не было —
+    # иначе тихий, но реально зависший цикл неотличим от тихого рабочего.
+    HEARTBEAT_SECONDS = 1800
+
     async def listen(self, get_monitored_ids: Callable[[], set[str]]) -> AsyncIterator[NormalizedMessage]:
         last_uid: dict[str, int] = {}
+        consecutive_failures = 0
+        time_since_heartbeat = 0.0
         while True:
+            any_failure_this_cycle = False
+
             for folder in get_monitored_ids():
                 if folder not in last_uid:
                     # Первый раз для этой папки — не тащим всю историю,
@@ -326,16 +338,35 @@ class YandexMailAdapter(SourceAdapter):
                         last_uid[folder] = await asyncio.to_thread(self._get_latest_uid_sync, folder)
                     except Exception:
                         logger.exception("Не удалось получить стартовый UID для папки %s", folder)
+                        any_failure_this_cycle = True
                     continue
 
                 try:
                     messages, new_max = await asyncio.to_thread(self._fetch_new_sync, folder, last_uid[folder])
                 except Exception:
                     logger.exception("Ошибка при опросе папки %s", folder)
+                    any_failure_this_cycle = True
                     continue
 
                 last_uid[folder] = new_max
                 for m in messages:
                     yield m
 
-            await asyncio.sleep(self.poll_seconds)
+            if any_failure_this_cycle:
+                consecutive_failures += 1
+                delay = min(self.FAILURE_RETRY_SECONDS * consecutive_failures, self.poll_seconds)
+                logger.warning(
+                    "Почта: цикл опроса с ошибкой (%d подряд), следующая попытка через %d с.",
+                    consecutive_failures, delay,
+                )
+            else:
+                if consecutive_failures:
+                    logger.info("Почта: опрос восстановился после %d неудачных циклов подряд.", consecutive_failures)
+                consecutive_failures = 0
+                delay = self.poll_seconds
+                time_since_heartbeat += delay
+                if time_since_heartbeat >= self.HEARTBEAT_SECONDS:
+                    time_since_heartbeat = 0.0
+                    logger.info("Почта: опрос активен, папок: %d", len(last_uid))
+
+            await asyncio.sleep(delay)
